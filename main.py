@@ -1,66 +1,128 @@
-import os, time, threading, requests, io
-from flask import Flask
-from PIL import Image, ImageDraw
+import os, re, json, time, asyncio, requests, tempfile
+from datetime import datetime
+from telethon import TelegramClient, events
+from telethon.sessions import StringSession
 
+# --- CONFIG depuis Render ENV ---
+API_ID = int(os.getenv("API_ID", "30423183"))
+API_HASH = os.getenv("API_HASH", "af1df27cec6c9f339bb6e9f9c192d814")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-CHAT_ID = os.getenv("DEST_GROUP")
-PORT = int(os.environ.get("PORT", 10000))
-app = Flask(__name__)
-@app.route('/')
-def home(): return "ES V4.1 LIVE"
+DEST_GROUP = int(os.getenv("DEST_GROUP", "-1003813643708"))
+SOURCE_BOT = os.getenv("SOURCE_BOT", "atas_alerts_bot")
+STRING_SESSION = os.getenv("STRING_SESSION")
 
-def get_es_ohlc():
+if not STRING_SESSION:
+    print("ERREUR: STRING_SESSION manquant dans Render Environment!")
+    exit(1)
+if not BOT_TOKEN:
+    print("ERREUR: BOT_TOKEN manquant!")
+    exit(1)
+
+tg_client = TelegramClient(StringSession(STRING_SESSION), API_ID, API_HASH)
+
+DATA_DIR = os.path.join(tempfile.gettempdir(), 'es_data')
+os.makedirs(DATA_DIR, exist_ok=True)
+
+DICT_ATAS = {
+    "Put Wall": "🟥 PUT WALL = Mur support gamma. Cassure baissiere = acceleration.",
+    "Call Wall": "🟩 CALL WALL = Mur resistance gamma. Cassure haussiere = acceleration.",
+    "pTrans": "pTrans = Seuil gamma intermediaire Put.",
+    "cTrans": "cTrans = Seuil gamma intermediaire Call.",
+    "crosses": "⚡ CROSS = Cassure confirmee. Changement de regime.",
+    "approaching": "👀 Approche d'un mur. On observe.",
+    "backwardation": "🔴 BACKWARDATION = STRESS extreme.",
+    "contango": "🟢 CONTANGO = Calme.",
+    "IVR 100": "🔥 IVR 100% = Volatilite max.",
+    "IVR very low": "💤 IVR tres bas = Breakout imminent.",
+    "Gamma flip": "🔄 GAMMA FLIP = Dealers changent de camp.",
+    "Dealer long gamma": "Dealer long gamma = Marche colle.",
+    "Dealer short gamma": "Dealer short gamma = Mouvements rapides.",
+    "VWAP": "VWAP = Prix moyen journee."
+}
+
+def tradui_reelle(atas_text, es_price=""):
+    low = atas_text.lower()
+    expl = [v for k,v in DICT_ATAS.items() if k.lower() in low]
+    if not expl: expl = ["Alerte ATAS detectee."]
+    if "backwardation" in low or ("put wall" in low and "cross" in low):
+        action = "👉 ACTION: Ne BUY pas. Attends SHORT pullback. Stop 15-20pts."
+    elif "call wall" in low and "cross" in low:
+        action = "👉 ACTION: Biais LONG sur pullback."
+    elif "approaching" in low:
+        action = "👉 ACTION: Reste en dehors."
+    else:
+        action = "👉 ACTION: Note le niveau."
+    return f"🤖 *ALERTE - {datetime.now().strftime('%H:%M:%S')}*\nBrut: `{atas_text}`\n{chr(10).join(expl)}\n\n{action}\nES: {es_price}\n"
+
+last_atas_msg = time.time()
+flood_buffer = []
+flood_mode = False
+cache = {}
+
+async def send_to_private(text):
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     try:
-        url = "https://query1.finance.yahoo.com/v8/finance/chart/ES=F?range=1d&interval=5m"
-        r = requests.get(url, headers={"User-Agent":"Mozilla/5.0"}, timeout=12).json()
-        meta = r['chart']['result'][0]['meta']
-        q = r['chart']['result'][0]['indicators']['quote'][0]
-        o,h,l,c = q['open'], q['high'], q['low'], q['close']
-        data=[]
-        for i in range(len(c)):
-            if c[i] is None: continue
-            data.append((o[i],h[i],l[i],c[i]))
-        data=data[-80:]
-        return meta['regularMarketPrice'], meta.get('chartPreviousClose', c[-2]), max([x[1] for x in data]), min([x[2] for x in data]), data
+        requests.post(url, data={"chat_id": DEST_GROUP, "text": text, "parse_mode":"Markdown"}, timeout=10)
     except Exception as e:
-        print(f"V4 err {e}", flush=True)
-        return 7746,7740,7752,7736,[(7740,7750,7735,7746)]*40
+        print(f"Send fail: {e}")
 
-def make_candle_chart(price, prev, dh, dl, data):
-    W,H=900,500; top,bottom=60,40
-    img=Image.new('RGB',(W,H),'#0B0E14'); d=ImageDraw.Draw(img)
-    for y in range(top,H-bottom,60): d.line([(0,y),(W,y)], fill='#1A1E28')
-    ch=H-top-bottom
-    all_l=min([x[2] for x in data]); all_h=max([x[1] for x in data])
-    pad=(all_h-all_l)*0.15 if all_h!=all_l else 10; mn,mx=all_l-pad, all_h+pad
-    def y_of(v): return top + (mx-v)/(mx-mn)*ch
-    n=len(data); cw=max(3,(W-20)//n-2)
-    for i,(o,h,l,c) in enumerate(data):
-        x=10+i*(W-20)//n+(W-20)//n//2; col='#00E676' if c>=o else '#FF1744'
-        d.line([(x,y_of(h)),(x,y_of(l))], fill='#8A8D93', width=1)
-        yo, yc = y_of(o), y_of(c)
-        d.rectangle([(x-cw//2,min(yo,yc)),(x+cw//2,max(yo,yc))], fill=col, outline=col)
-    pct=(price-prev)/prev*100 if prev else 0; col_pct='#00E676' if pct>=0 else '#FF1744'
-    d.rectangle([(0,0),(W,50)], fill='#12151E')
-    d.text((15,12), f"ES FUTURE {price:.2f} {pct:+.2f}%", fill='white')
-    d.text((15,H-28), f"H:{dh:.2f} L:{dl:.2f} 5m x 80 | Vianos H24", fill='#8A8D93')
-    d.text((W-140,12), f"LIVE {time.strftime('%H:%M')}", fill=col_pct)
-    buf=io.BytesIO(); img.save(buf, format='PNG'); buf.seek(0); return buf
+@tg_client.on(events.NewMessage)
+async def handler(event):
+    global flood_mode, flood_buffer, last_atas_msg
+    sender = await event.get_sender()
+    username = getattr(sender, 'username', '') or ''
+    if SOURCE_BOT.lower() not in username.lower():
+        try:
+            chat = await event.get_chat()
+            if SOURCE_BOT.lower() not in (getattr(chat,'username','') or '').lower():
+                return
+        except: return
+    raw = event.message.text
+    if not raw: return
+    last_atas_msg = time.time()
+    flood_buffer.append((time.time(), raw))
+    flood_buffer = [x for x in flood_buffer if time.time()-x[0] < 20]
+    if len(flood_buffer) > 6 and not flood_mode:
+        flood_mode = True
+        await send_to_private("🔄 *ATAS SYNC...* Flood detecte, je filtre.")
+        return
+    if flood_mode:
+        if time.time() - flood_buffer[-1][0] > 25:
+            resume = "\n".join([f"- {t}" for _,t in flood_buffer[-15:]])
+            await send_to_private(f"🔄 *SYNC TERMINEE - {len(flood_buffer)} alertes*\n{resume}")
+            flood_buffer.clear()
+            flood_mode = False
+        return
+    key = re.sub(r'\d+(\.\d+)?', 'X', raw)
+    if key in cache and time.time()-cache[key] < 300:
+        if not any(k in raw.lower() for k in ["crosses","backwardation","ivr 100"]): return
+    cache[key]=time.time()
+    es_price="N/A"
+    try:
+        r=requests.get("https://query1.finance.yahoo.com/v8/finance/chart/ES=F?range=1d&interval=1m",headers={"User-Agent":"Mozilla/5.0"},timeout=5).json()
+        es_price=f"{r['chart']['result'][0]['meta']['regularMarketPrice']:.2f}"
+    except: pass
+    await send_to_private(tradui_reelle(raw, es_price))
 
-def bot_loop():
-    print("BOT V4.1 START", flush=True)
+async def watchdog():
+    global last_atas_msg
+    while True:
+        await asyncio.sleep(60)
+        if time.time() - last_atas_msg > 900:
+            if 9 <= datetime.now().hour <= 23:
+                await send_to_private("🔌 *DECONNEXION* - Plus de signal ATAS depuis 15 min.")
+                last_atas_msg = time.time()+600
+
+async def main():
     while True:
         try:
-            price,prev,dh,dl,data=get_es_ohlc()
-            pct=(price-prev)/prev*100 if prev else 0
-            caption=f"🟢 ES {price:.2f} ({pct:+.2f}%) | H:{dh:.0f} L:{dl:.0f} | V4.1"
-            chart=make_candle_chart(price,prev,dh,dl,data)
-            url=f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto"
-            r=requests.post(url,data={"chat_id":CHAT_ID,"caption":caption},files={"photo":chart},timeout=20)
-            print(f"V4.1 Sent {price} {r.status_code}", flush=True)
+            print(f"=== ES Interpreter START - Ecoute @{SOURCE_BOT} -> {DEST_GROUP} ===", flush=True)
+            await tg_client.start()
+            tg_client.loop.create_task(watchdog())
+            await tg_client.run_until_disconnected()
         except Exception as e:
-            print(f"V4.1 err {e}", flush=True)
-        time.sleep(900)
+            print(f"Connexion perdue: {e} - Reconnexion 5s...", flush=True)
+            await asyncio.sleep(5)
 
-threading.Thread(target=bot_loop, daemon=True).start()
-if __name__=="__main__": app.run(host='0.0.0.0',port=PORT)
+if __name__ == "__main__":
+    asyncio.run(main())
