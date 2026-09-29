@@ -1,7 +1,19 @@
-import os, re, json, time, asyncio, requests, tempfile
+import os, re, json, time, asyncio, requests, tempfile, threading
 from datetime import datetime
+from flask import Flask
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
+
+# --- Mini serveur web pour Render ---
+app = Flask(__name__)
+@app.route('/')
+def home():
+    return "ES Bot is running - OK"
+
+def run_web():
+    app.run(host='0.0.0.0', port=10000)
+
+threading.Thread(target=run_web, daemon=True).start()
 
 # --- CONFIG depuis Render ENV ---
 API_ID = int(os.getenv("API_ID", "30423183"))
